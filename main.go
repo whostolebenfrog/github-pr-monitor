@@ -56,15 +56,16 @@ type PRMenuItem struct {
 }
 
 var (
-	config        Config
-	configDir     string
-	defaultClient *github.Client
-	orgClients    map[string]*github.Client
-	prs           []PRInfo
-	prsMutex      sync.RWMutex
-	menuItems     []PRMenuItem
-	ignoredPRs    map[string]bool
-	ignoreMutex   sync.RWMutex
+	config         Config
+	configDir      string
+	defaultClient  *github.Client
+	orgClients     map[string]*github.Client
+	prs            []PRInfo
+	prsMutex       sync.RWMutex
+	menuItems      []PRMenuItem
+	ignoredPRs     map[string]bool
+	ignoreMutex    sync.RWMutex
+	mClearIgnored  *systray.MenuItem
 )
 
 func main() {
@@ -250,12 +251,11 @@ func ignoredCount() int {
 }
 
 func onReady() {
-	systray.SetIcon(generateIcon())
+	systray.SetIcon(getIcon(false))
 	systray.SetTitle("")
 	systray.SetTooltip("PR Monitor - Loading...")
 
 	mRefresh := systray.AddMenuItem("Refresh Now", "Check for PRs now")
-	mClearIgnored := systray.AddMenuItem("Clear Ignored PRs", "Show all previously ignored PRs again")
 	systray.AddSeparator()
 
 	// Pre-allocate menu items for PRs with submenus
@@ -268,6 +268,9 @@ func onReady() {
 	}
 
 	systray.AddSeparator()
+	mClearIgnored = systray.AddMenuItem("Clear Ignored PRs", "Show all previously ignored PRs again")
+	mClearConfirm := mClearIgnored.AddSubMenuItem("Yes, clear all ignored PRs", "This cannot be undone")
+	mClearIgnored.Hide()
 	mQuit := systray.AddMenuItem("Quit", "Quit PR Monitor")
 
 	// Start polling
@@ -279,7 +282,7 @@ func onReady() {
 			select {
 			case <-mRefresh.ClickedCh:
 				go refreshPRs()
-			case <-mClearIgnored.ClickedCh:
+			case <-mClearConfirm.ClickedCh:
 				clearIgnored()
 			case <-mQuit.ClickedCh:
 				systray.Quit()
@@ -481,6 +484,9 @@ func updateMenu() {
 	count := len(prs)
 	ignored := ignoredCount()
 
+	// Update icon based on whether there are PRs needing attention
+	systray.SetIcon(getIcon(count > 0))
+
 	if count == 0 {
 		systray.SetTitle("")
 		if ignored > 0 {
@@ -495,6 +501,14 @@ func updateMenu() {
 		} else {
 			systray.SetTooltip(fmt.Sprintf("%d PRs need your attention", count))
 		}
+	}
+
+	// Update clear ignored menu item
+	if ignored > 0 {
+		mClearIgnored.SetTitle(fmt.Sprintf("Clear Ignored PRs (%d)", ignored))
+		mClearIgnored.Show()
+	} else {
+		mClearIgnored.Hide()
 	}
 
 	// Update menu items

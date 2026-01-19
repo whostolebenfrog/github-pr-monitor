@@ -1,0 +1,16 @@
+# Binary
+pr-monitor
+pr-monitor.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config (contains secrets)
+config.yaml

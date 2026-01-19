@@ -9,7 +9,8 @@ A lightweight system tray app that monitors GitHub PRs from your colleagues that
 - Detects PRs that need review (no approvals yet)
 - Detects PRs that need re-approval (new commits after approval)
 - Automatically skips draft PRs
-- Shows PR count in system tray with icon
+- White system tray icon with red notification dot when PRs need attention
+- Shows PR count next to icon
 - Click any PR to open in browser
 - Ignore PRs you don't want to review (persisted across restarts)
 - Per-organization GitHub token support for fine-grained access
@@ -86,18 +87,23 @@ Simply run:
 
 The app will appear in your system tray with a PR icon. When PRs need attention, a count appears next to the icon.
 
-### System Tray
+### System Tray Icon
 
-- **Icon** - Shows a merge/PR symbol
-- **Count** - Number appears next to icon when PRs need attention (hidden when zero)
-- **Tooltip** - Hover to see count details (includes ignored count)
-- **PR List** - Click to see list of PRs needing review
-- Each PR has a submenu with:
+The app displays a white merge/PR icon in your system tray, designed for visibility on dark menu bars.
+
+**Visual indicators:**
+- **No PRs waiting** - White PR icon only
+- **PRs need attention** - White PR icon with red notification dot + count
+
+**Menu items:**
+- **Refresh Now** - Manually refresh the PR list
+- **PR List** - Shows PRs needing review (click to expand submenu)
   - **Open in Browser** - Opens the PR in your default browser
   - **Ignore** - Hides this PR from the list
-- **Refresh Now** - Manually refresh the PR list
-- **Clear Ignored PRs** - Restore all previously ignored PRs
+- **Clear Ignored PRs (N)** - Shows count; requires confirmation click to clear
 - **Quit** - Exit PR Monitor
+
+**Tooltip** - Hover over the icon to see count details including ignored PRs.
 
 Ignored PRs are stored in `~/.config/pr-monitor/ignored.json` and persist across restarts.
 

@@ -7,46 +7,73 @@ import (
 	"image/png"
 )
 
-// generateIcon creates a simple PR icon for the menu bar
-// It's a 22x22 template image (black on transparent) showing a merge/PR symbol
-func generateIcon() []byte {
+var (
+	// Cache icons to avoid regenerating
+	iconNormal []byte
+	iconAlert  []byte
+)
+
+func init() {
+	iconNormal = generateIconWithAlert(false)
+	iconAlert = generateIconWithAlert(true)
+}
+
+// getIcon returns the appropriate icon based on whether there are PRs needing attention
+func getIcon(hasAlerts bool) []byte {
+	if hasAlerts {
+		return iconAlert
+	}
+	return iconNormal
+}
+
+// generateIconWithAlert creates a PR icon for the menu bar
+// Uses white color for visibility on dark menu bars
+// Adds a red notification dot when hasAlert is true
+func generateIconWithAlert(hasAlert bool) []byte {
 	const size = 22
 	img := image.NewRGBA(image.Rect(0, 0, size, size))
+
+	// Use white for the icon (visible on dark menu bars)
+	white := color.RGBA{255, 255, 255, 255}
 
 	// Draw a simple PR/merge icon:
 	// - A vertical line on the left (source branch)
 	// - A diagonal line merging into a vertical line on the right (target branch)
-	black := color.RGBA{0, 0, 0, 255}
 
 	// Left vertical line (source branch) - from top to middle
 	for y := 3; y <= 11; y++ {
-		img.Set(6, y, black)
-		img.Set(7, y, black)
+		img.Set(6, y, white)
+		img.Set(7, y, white)
 	}
 
 	// Right vertical line (target branch) - full height
 	for y := 3; y <= 18; y++ {
-		img.Set(14, y, black)
-		img.Set(15, y, black)
+		img.Set(14, y, white)
+		img.Set(15, y, white)
 	}
 
 	// Diagonal merge line from left branch to right branch
-	// Goes from (7, 11) to (14, 14)
 	for i := 0; i <= 7; i++ {
 		x := 7 + i
 		y := 11 + (i * 3 / 7)
-		img.Set(x, y, black)
-		img.Set(x, y+1, black)
+		img.Set(x, y, white)
+		img.Set(x, y+1, white)
 	}
 
 	// Small circle at top of left branch (commit dot)
-	drawCircle(img, 6, 4, 2, black)
+	drawCircle(img, 6, 4, 2, white)
 
 	// Small circle at top of right branch (commit dot)
-	drawCircle(img, 14, 4, 2, black)
+	drawCircle(img, 14, 4, 2, white)
 
 	// Small circle at bottom of right branch (merge point)
-	drawCircle(img, 14, 17, 2, black)
+	drawCircle(img, 14, 17, 2, white)
+
+	// Add red notification dot in top-right corner if there are alerts
+	if hasAlert {
+		red := color.RGBA{255, 59, 48, 255} // iOS-style red
+		drawCircle(img, 18, 4, 3, red)
+	}
 
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, img); err != nil {
