@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,18 +22,39 @@ import (
 )
 
 const (
-	maxMenuItems        = 20
-	defaultPollInterval = 5 * time.Minute
-	defaultMaxAgeDays   = 3
+	maxMenuItems = 20
+	// How often the scheduler checks if repos need polling
+	schedulerInterval = 30 * time.Second
+	// Jitter as a fraction of the poll interval (±20%)
+	jitterFraction = 0.2
 )
 
+// Default poll intervals
+var defaultPollIntervals = PollIntervals{
+	High:   2 * time.Minute,
+	Medium: 15 * time.Minute,
+	Low:    2 * time.Hour,
+}
+
+type PollIntervals struct {
+	High   time.Duration `yaml:"high"`
+	Medium time.Duration `yaml:"medium"`
+	Low    time.Duration `yaml:"low"`
+}
+
+type ReposByPriority struct {
+	High   []string `yaml:"high"`
+	Medium []string `yaml:"medium"`
+	Low    []string `yaml:"low"`
+}
+
 type Config struct {
-	GitHubToken  string            `yaml:"github_token"`
-	OrgTokens    map[string]string `yaml:"org_tokens"`
-	PollInterval time.Duration     `yaml:"poll_interval"`
-	MaxAgeDays   int               `yaml:"max_age_days"`
-	Repos        []string          `yaml:"repos"`
-	Authors      []string          `yaml:"authors"`
+	GitHubToken   string            `yaml:"github_token"`
+	OrgTokens     map[string]string `yaml:"org_tokens"`
+	PollIntervals PollIntervals     `yaml:"poll_intervals"`
+	MaxAgeDays    int               `yaml:"max_age_days"`
+	Repos         ReposByPriority   `yaml:"repos"`
+	Authors       []string          `yaml:"authors"`
 }
 
 type PRInfo struct {
@@ -55,17 +77,27 @@ type PRMenuItem struct {
 	ignore *systray.MenuItem
 }
 
+type repoState struct {
+	name       string
+	priority   string
+	interval   time.Duration
+	lastPolled time.Time
+	nextPoll   time.Time
+}
+
 var (
-	config         Config
-	configDir      string
-	defaultClient  *github.Client
-	orgClients     map[string]*github.Client
-	prs            []PRInfo
-	prsMutex       sync.RWMutex
-	menuItems      []PRMenuItem
-	ignoredPRs     map[string]bool
-	ignoreMutex    sync.RWMutex
-	mClearIgnored  *systray.MenuItem
+	config        Config
+	configDir     string
+	defaultClient *github.Client
+	orgClients    map[string]*github.Client
+	prs           []PRInfo
+	prsMutex      sync.RWMutex
+	menuItems     []PRMenuItem
+	ignoredPRs    map[string]bool
+	ignoreMutex   sync.RWMutex
+	mClearIgnored *systray.MenuItem
+	repoStates    []*repoState
+	repoMutex     sync.Mutex
 )
 
 func main() {
@@ -85,6 +117,7 @@ func main() {
 	}
 
 	initClients()
+	initRepoStates()
 
 	systray.Run(onReady, onExit)
 }
@@ -100,15 +133,23 @@ func loadConfig() error {
 		return err
 	}
 
-	if config.PollInterval == 0 {
-		config.PollInterval = defaultPollInterval
+	// Apply defaults for poll intervals
+	if config.PollIntervals.High == 0 {
+		config.PollIntervals.High = defaultPollIntervals.High
+	}
+	if config.PollIntervals.Medium == 0 {
+		config.PollIntervals.Medium = defaultPollIntervals.Medium
+	}
+	if config.PollIntervals.Low == 0 {
+		config.PollIntervals.Low = defaultPollIntervals.Low
 	}
 
 	if config.MaxAgeDays == 0 {
-		config.MaxAgeDays = defaultMaxAgeDays
+		config.MaxAgeDays = 3
 	}
 
-	if len(config.Repos) == 0 {
+	allRepos := getAllRepos()
+	if len(allRepos) == 0 {
 		return fmt.Errorf("no repositories configured")
 	}
 
@@ -116,7 +157,7 @@ func loadConfig() error {
 		return fmt.Errorf("no authors configured")
 	}
 
-	for _, repo := range config.Repos {
+	for _, repo := range allRepos {
 		if !strings.Contains(repo, "/") {
 			return fmt.Errorf("invalid repo format %q: expected owner/repo", repo)
 		}
@@ -125,18 +166,51 @@ func loadConfig() error {
 	return nil
 }
 
+func getAllRepos() []string {
+	var all []string
+	all = append(all, config.Repos.High...)
+	all = append(all, config.Repos.Medium...)
+	all = append(all, config.Repos.Low...)
+	return all
+}
+
+func initRepoStates() {
+	now := time.Now()
+
+	addRepos := func(repos []string, priority string, interval time.Duration) {
+		for i, repo := range repos {
+			// Stagger initial polls to avoid thundering herd
+			initialDelay := time.Duration(i) * (interval / time.Duration(len(repos)+1))
+			repoStates = append(repoStates, &repoState{
+				name:       repo,
+				priority:   priority,
+				interval:   interval,
+				lastPolled: time.Time{},
+				nextPoll:   now.Add(initialDelay),
+			})
+		}
+	}
+
+	addRepos(config.Repos.High, "high", config.PollIntervals.High)
+	addRepos(config.Repos.Medium, "medium", config.PollIntervals.Medium)
+	addRepos(config.Repos.Low, "low", config.PollIntervals.Low)
+}
+
+func addJitter(interval time.Duration) time.Duration {
+	jitter := time.Duration(float64(interval) * jitterFraction * (2*rand.Float64() - 1))
+	return interval + jitter
+}
+
 func initClients() {
 	ctx := context.Background()
 	orgClients = make(map[string]*github.Client)
 
-	// Create default client if token provided
 	if config.GitHubToken != "" {
 		ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: config.GitHubToken})
 		tc := oauth2.NewClient(ctx, ts)
 		defaultClient = github.NewClient(tc)
 	}
 
-	// Create org-specific clients
 	for org, token := range config.OrgTokens {
 		ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
 		tc := oauth2.NewClient(ctx, ts)
@@ -155,7 +229,6 @@ func getClientForOrg(org string) *github.Client {
 	if defaultClient != nil {
 		return defaultClient
 	}
-	// This shouldn't happen if initClients validated properly
 	log.Printf("Warning: No client available for org %s", org)
 	return nil
 }
@@ -212,7 +285,6 @@ func ignorePR(key string) {
 		log.Printf("Error saving ignored PRs: %v", err)
 	}
 
-	// Remove the PR from the list immediately
 	prsMutex.Lock()
 	filtered := make([]PRInfo, 0, len(prs))
 	for _, pr := range prs {
@@ -235,7 +307,7 @@ func clearIgnored() {
 		log.Printf("Error saving ignored PRs: %v", err)
 	}
 
-	go refreshPRs()
+	go refreshAllRepos()
 }
 
 func isIgnored(key string) bool {
@@ -255,10 +327,9 @@ func onReady() {
 	systray.SetTitle("")
 	systray.SetTooltip("PR Monitor - Loading...")
 
-	mRefresh := systray.AddMenuItem("Refresh Now", "Check for PRs now")
+	mRefresh := systray.AddMenuItem("Refresh Now", "Check all repos now")
 	systray.AddSeparator()
 
-	// Pre-allocate menu items for PRs with submenus
 	for i := 0; i < maxMenuItems; i++ {
 		parent := systray.AddMenuItem("", "")
 		open := parent.AddSubMenuItem("Open in Browser", "Open this PR in your browser")
@@ -273,15 +344,13 @@ func onReady() {
 	mClearIgnored.Hide()
 	mQuit := systray.AddMenuItem("Quit", "Quit PR Monitor")
 
-	// Start polling
-	go pollLoop()
+	go schedulerLoop()
 
-	// Handle menu clicks
 	go func() {
 		for {
 			select {
 			case <-mRefresh.ClickedCh:
-				go refreshPRs()
+				go refreshAllRepos()
 			case <-mClearConfirm.ClickedCh:
 				clearIgnored()
 			case <-mQuit.ClickedCh:
@@ -290,7 +359,6 @@ func onReady() {
 		}
 	}()
 
-	// Handle PR item clicks
 	for i, item := range menuItems {
 		go handlePRMenuClicks(i, item)
 	}
@@ -325,21 +393,54 @@ func handlePRMenuClicks(index int, item PRMenuItem) {
 	}
 }
 
-func onExit() {
-	// Cleanup if needed
-}
+func onExit() {}
 
-func pollLoop() {
-	refreshPRs()
-	ticker := time.NewTicker(config.PollInterval)
+func schedulerLoop() {
+	// Initial full refresh
+	refreshAllRepos()
+
+	ticker := time.NewTicker(schedulerInterval)
 	for range ticker.C {
-		refreshPRs()
+		checkAndPollRepos()
 	}
 }
 
-func refreshPRs() {
+func checkAndPollRepos() {
+	now := time.Now()
+	var reposToRefresh []string
+
+	repoMutex.Lock()
+	for _, state := range repoStates {
+		if now.After(state.nextPoll) {
+			reposToRefresh = append(reposToRefresh, state.name)
+			state.lastPolled = now
+			state.nextPoll = now.Add(addJitter(state.interval))
+		}
+	}
+	repoMutex.Unlock()
+
+	if len(reposToRefresh) > 0 {
+		refreshRepos(reposToRefresh)
+	}
+}
+
+func refreshAllRepos() {
+	now := time.Now()
+
+	repoMutex.Lock()
+	allRepos := make([]string, len(repoStates))
+	for i, state := range repoStates {
+		allRepos[i] = state.name
+		state.lastPolled = now
+		state.nextPoll = now.Add(addJitter(state.interval))
+	}
+	repoMutex.Unlock()
+
+	refreshRepos(allRepos)
+}
+
+func refreshRepos(repos []string) {
 	ctx := context.Background()
-	var newPRs []PRInfo
 
 	authorSet := make(map[string]bool)
 	for _, a := range config.Authors {
@@ -349,73 +450,95 @@ func refreshPRs() {
 	maxAge := time.Duration(config.MaxAgeDays) * 24 * time.Hour
 	cutoff := time.Now().Add(-maxAge)
 
-	for _, repo := range config.Repos {
-		owner, repoName := parseRepo(repo)
-		if owner == "" {
+	// Collect PRs from specified repos
+	var newPRsFromRepos []PRInfo
+	repoSet := make(map[string]bool)
+	for _, repo := range repos {
+		repoSet[repo] = true
+		repoPRs := fetchRepoPRs(ctx, repo, authorSet, cutoff)
+		newPRsFromRepos = append(newPRsFromRepos, repoPRs...)
+	}
+
+	// Merge with existing PRs from repos we didn't refresh
+	prsMutex.Lock()
+	var mergedPRs []PRInfo
+	for _, pr := range prs {
+		if !repoSet[pr.Repo] {
+			mergedPRs = append(mergedPRs, pr)
+		}
+	}
+	mergedPRs = append(mergedPRs, newPRsFromRepos...)
+
+	// Sort by repo then number
+	sort.Slice(mergedPRs, func(i, j int) bool {
+		if mergedPRs[i].Repo != mergedPRs[j].Repo {
+			return mergedPRs[i].Repo < mergedPRs[j].Repo
+		}
+		return mergedPRs[i].Number < mergedPRs[j].Number
+	})
+
+	prs = mergedPRs
+	prsMutex.Unlock()
+
+	updateMenu()
+}
+
+func fetchRepoPRs(ctx context.Context, repo string, authorSet map[string]bool, cutoff time.Time) []PRInfo {
+	var result []PRInfo
+
+	owner, repoName := parseRepo(repo)
+	if owner == "" {
+		return result
+	}
+
+	client := getClientForOrg(owner)
+	if client == nil {
+		log.Printf("No client available for %s", repo)
+		return result
+	}
+
+	pulls, _, err := client.PullRequests.List(ctx, owner, repoName, &github.PullRequestListOptions{
+		State:       "open",
+		ListOptions: github.ListOptions{PerPage: 100},
+	})
+	if err != nil {
+		log.Printf("Error fetching PRs for %s: %v", repo, err)
+		return result
+	}
+
+	for _, pr := range pulls {
+		author := pr.GetUser().GetLogin()
+		if !authorSet[author] {
 			continue
 		}
 
-		client := getClientForOrg(owner)
-		if client == nil {
-			log.Printf("No client available for %s", repo)
+		if pr.GetCreatedAt().Before(cutoff) {
 			continue
 		}
 
-		pulls, _, err := client.PullRequests.List(ctx, owner, repoName, &github.PullRequestListOptions{
-			State:       "open",
-			ListOptions: github.ListOptions{PerPage: 100},
-		})
-		if err != nil {
-			log.Printf("Error fetching PRs for %s: %v", repo, err)
+		if pr.GetDraft() {
 			continue
 		}
 
-		for _, pr := range pulls {
-			author := pr.GetUser().GetLogin()
-			if !authorSet[author] {
-				continue
+		needsReview, needsReapproval := checkReviewStatus(ctx, client, owner, repoName, pr)
+		if needsReview || needsReapproval {
+			prInfo := PRInfo{
+				Repo:            repo,
+				Number:          pr.GetNumber(),
+				Title:           pr.GetTitle(),
+				Author:          author,
+				URL:             pr.GetHTMLURL(),
+				NeedsReview:     needsReview,
+				NeedsReapproval: needsReapproval,
 			}
 
-			if pr.GetCreatedAt().Before(cutoff) {
-				continue
-			}
-
-			if pr.GetDraft() {
-				continue
-			}
-
-			needsReview, needsReapproval := checkReviewStatus(ctx, client, owner, repoName, pr)
-			if needsReview || needsReapproval {
-				prInfo := PRInfo{
-					Repo:            repo,
-					Number:          pr.GetNumber(),
-					Title:           pr.GetTitle(),
-					Author:          author,
-					URL:             pr.GetHTMLURL(),
-					NeedsReview:     needsReview,
-					NeedsReapproval: needsReapproval,
-				}
-
-				if !isIgnored(prInfo.Key()) {
-					newPRs = append(newPRs, prInfo)
-				}
+			if !isIgnored(prInfo.Key()) {
+				result = append(result, prInfo)
 			}
 		}
 	}
 
-	// Sort by repo then number
-	sort.Slice(newPRs, func(i, j int) bool {
-		if newPRs[i].Repo != newPRs[j].Repo {
-			return newPRs[i].Repo < newPRs[j].Repo
-		}
-		return newPRs[i].Number < newPRs[j].Number
-	})
-
-	prsMutex.Lock()
-	prs = newPRs
-	prsMutex.Unlock()
-
-	updateMenu()
+	return result
 }
 
 func checkReviewStatus(ctx context.Context, client *github.Client, owner, repo string, pr *github.PullRequest) (needsReview, needsReapproval bool) {
@@ -429,7 +552,6 @@ func checkReviewStatus(ctx context.Context, client *github.Client, owner, repo s
 		return true, false
 	}
 
-	// Get the latest review state per user
 	latestReviews := make(map[string]*github.PullRequestReview)
 	for _, review := range reviews {
 		user := review.GetUser().GetLogin()
@@ -439,7 +561,6 @@ func checkReviewStatus(ctx context.Context, client *github.Client, owner, repo s
 		}
 	}
 
-	// Check if there's an approval
 	var hasApproval bool
 	var latestApprovalTime time.Time
 	for _, review := range latestReviews {
@@ -455,7 +576,6 @@ func checkReviewStatus(ctx context.Context, client *github.Client, owner, repo s
 		return true, false
 	}
 
-	// Check if there are commits after the latest approval
 	commits, _, err := client.PullRequests.ListCommits(ctx, owner, repo, pr.GetNumber(), &github.ListOptions{PerPage: 100})
 	if err != nil {
 		log.Printf("Error fetching commits for %s#%d: %v", repo, pr.GetNumber(), err)
@@ -484,7 +604,6 @@ func updateMenu() {
 	count := len(prs)
 	ignored := ignoredCount()
 
-	// Update icon based on whether there are PRs needing attention
 	systray.SetIcon(getIcon(count > 0))
 
 	if count == 0 {
@@ -503,7 +622,6 @@ func updateMenu() {
 		}
 	}
 
-	// Update clear ignored menu item
 	if ignored > 0 {
 		mClearIgnored.SetTitle(fmt.Sprintf("Clear Ignored PRs (%d)", ignored))
 		mClearIgnored.Show()
@@ -511,7 +629,6 @@ func updateMenu() {
 		mClearIgnored.Hide()
 	}
 
-	// Update menu items
 	for i, item := range menuItems {
 		if i < len(prs) {
 			pr := prs[i]

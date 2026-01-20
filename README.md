@@ -5,6 +5,8 @@ A lightweight system tray app that monitors GitHub PRs from your colleagues that
 ## Features
 
 - Polls multiple GitHub repositories for open PRs
+- Priority-based polling: high/medium/low priority repos with different intervals
+- Jittered poll times to avoid API rate limit spikes
 - Filters PRs by specified authors (your colleagues)
 - Detects PRs that need review (no approvals yet)
 - Detects PRs that need re-approval (new commits after approval)
@@ -138,17 +140,25 @@ org_tokens:
   myorg: "ghp_token_for_myorg"
   anotherorg: "ghp_token_for_anotherorg"
 
-# How often to check for new PRs (Go duration format: 1m, 5m, 30s, etc.)
-poll_interval: 5m
+# Poll intervals by priority level (Go duration format: 1m, 5m, 30s, etc.)
+# Higher priority repos are checked more frequently
+poll_intervals:
+  high: 2m      # Default: 2 minutes
+  medium: 15m   # Default: 15 minutes
+  low: 2h       # Default: 2 hours
 
 # Only show PRs created within the last N days (default: 3)
 max_age_days: 3
 
-# Repositories to monitor (owner/repo format)
+# Repositories to monitor, grouped by priority (owner/repo format)
 repos:
-  - "myorg/repo1"
-  - "myorg/repo2"
-  - "anotherorg/project"
+  high:
+    - "myorg/critical-service"
+  medium:
+    - "myorg/repo1"
+    - "myorg/repo2"
+  low:
+    - "anotherorg/docs"
 
 # GitHub usernames whose PRs you want to review
 authors:

@@ -2,6 +2,19 @@
 
 All notable changes to PR Monitor will be documented in this file.
 
+## [0.2.0] - 2025-01-20
+
+### Added
+- Priority-based polling: repos can be assigned high, medium, or low priority
+- Configurable poll intervals per priority level (defaults: 2m, 15m, 2h)
+- Jittered poll times (±20%) to avoid thundering herd and API rate limit spikes
+- Staggered initial polls for repos in the same priority level
+
+### Changed
+- Config format: `repos` is now grouped by priority (`high`, `medium`, `low`)
+- Config format: `poll_interval` replaced by `poll_intervals` with per-priority durations
+- Larger red notification dot for better visibility
+
 ## [0.1.0] - 2025-01-19
 
 ### Added

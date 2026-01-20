@@ -72,7 +72,7 @@ func generateIconWithAlert(hasAlert bool) []byte {
 	// Add red notification dot in top-right corner if there are alerts
 	if hasAlert {
 		red := color.RGBA{255, 59, 48, 255} // iOS-style red
-		drawCircle(img, 18, 4, 3, red)
+		drawCircle(img, 18, 4, 4, red)
 	}
 
 	var buf bytes.Buffer
