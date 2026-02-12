@@ -2,10 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,40 +19,15 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const (
-	maxMenuItems = 20
-	// How often the scheduler checks if repos need polling
-	schedulerInterval = 30 * time.Second
-	// Jitter as a fraction of the poll interval (±20%)
-	jitterFraction = 0.2
-)
-
-// Default poll intervals
-var defaultPollIntervals = PollIntervals{
-	High:   2 * time.Minute,
-	Medium: 15 * time.Minute,
-	Low:    2 * time.Hour,
-}
-
-type PollIntervals struct {
-	High   time.Duration `yaml:"high"`
-	Medium time.Duration `yaml:"medium"`
-	Low    time.Duration `yaml:"low"`
-}
-
-type ReposByPriority struct {
-	High   []string `yaml:"high"`
-	Medium []string `yaml:"medium"`
-	Low    []string `yaml:"low"`
-}
+const maxMenuItems = 20
 
 type Config struct {
-	GitHubToken   string            `yaml:"github_token"`
-	OrgTokens     map[string]string `yaml:"org_tokens"`
-	PollIntervals PollIntervals     `yaml:"poll_intervals"`
-	MaxAgeDays    int               `yaml:"max_age_days"`
-	Repos         ReposByPriority   `yaml:"repos"`
-	Authors       []string          `yaml:"authors"`
+	GitHubToken         string            `yaml:"github_token"`
+	OrgTokens           map[string]string `yaml:"org_tokens"`
+	MaxAgeDays          int               `yaml:"max_age_days"`
+	Repos               []string          `yaml:"repos"`
+	Authors             []string          `yaml:"authors"`
+	FullRefreshInterval time.Duration     `yaml:"full_refresh_interval"`
 }
 
 type PRInfo struct {
@@ -78,14 +51,6 @@ type PRMenuItem struct {
 	review *systray.MenuItem
 }
 
-type repoState struct {
-	name       string
-	priority   string
-	interval   time.Duration
-	lastPolled time.Time
-	nextPoll   time.Time
-}
-
 var (
 	config        Config
 	configDir     string
@@ -94,11 +59,7 @@ var (
 	prs           []PRInfo
 	prsMutex      sync.RWMutex
 	menuItems     []PRMenuItem
-	ignoredPRs    map[string]bool
-	ignoreMutex   sync.RWMutex
 	mClearIgnored *systray.MenuItem
-	repoStates    []*repoState
-	repoMutex     sync.Mutex
 )
 
 func main() {
@@ -112,13 +73,23 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	if err := loadIgnored(); err != nil {
-		log.Printf("Warning: Failed to load ignored PRs: %v", err)
-		ignoredPRs = make(map[string]bool)
+	if err := openDB(); err != nil {
+		log.Fatalf("Failed to open database: %v", err)
+	}
+
+	if err := importIgnoredJSON(); err != nil {
+		log.Printf("Warning: Failed to import ignored.json: %v", err)
 	}
 
 	initClients()
-	initRepoStates()
+
+	// Load cached PRs from DB for instant startup
+	if cached, err := dbLoadActivePRs(); err == nil && len(cached) > 0 {
+		prsMutex.Lock()
+		prs = cached
+		prsMutex.Unlock()
+		log.Printf("Loaded %d cached PRs from database", len(cached))
+	}
 
 	systray.Run(onReady, onExit)
 }
@@ -130,27 +101,25 @@ func loadConfig() error {
 		return fmt.Errorf("config file not found at %s: %w", configPath, err)
 	}
 
-	if err := yaml.Unmarshal(data, &config); err != nil {
-		return err
+	// Try to detect old map-style repos config
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err == nil {
+		if repos, ok := raw["repos"]; ok {
+			if _, isMap := repos.(map[string]any); isMap {
+				return fmt.Errorf("config uses old map-style repos format. Please migrate to a flat list:\n\n  repos:\n    - owner/repo1\n    - owner/repo2\n\nSee config.example.yaml for the new format")
+			}
+		}
 	}
 
-	// Apply defaults for poll intervals
-	if config.PollIntervals.High == 0 {
-		config.PollIntervals.High = defaultPollIntervals.High
-	}
-	if config.PollIntervals.Medium == 0 {
-		config.PollIntervals.Medium = defaultPollIntervals.Medium
-	}
-	if config.PollIntervals.Low == 0 {
-		config.PollIntervals.Low = defaultPollIntervals.Low
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return err
 	}
 
 	if config.MaxAgeDays == 0 {
 		config.MaxAgeDays = 3
 	}
 
-	allRepos := getAllRepos()
-	if len(allRepos) == 0 {
+	if len(config.Repos) == 0 {
 		return fmt.Errorf("no repositories configured")
 	}
 
@@ -158,48 +127,13 @@ func loadConfig() error {
 		return fmt.Errorf("no authors configured")
 	}
 
-	for _, repo := range allRepos {
+	for _, repo := range config.Repos {
 		if !strings.Contains(repo, "/") {
 			return fmt.Errorf("invalid repo format %q: expected owner/repo", repo)
 		}
 	}
 
 	return nil
-}
-
-func getAllRepos() []string {
-	var all []string
-	all = append(all, config.Repos.High...)
-	all = append(all, config.Repos.Medium...)
-	all = append(all, config.Repos.Low...)
-	return all
-}
-
-func initRepoStates() {
-	now := time.Now()
-
-	addRepos := func(repos []string, priority string, interval time.Duration) {
-		for i, repo := range repos {
-			// Stagger initial polls to avoid thundering herd
-			initialDelay := time.Duration(i) * (interval / time.Duration(len(repos)+1))
-			repoStates = append(repoStates, &repoState{
-				name:       repo,
-				priority:   priority,
-				interval:   interval,
-				lastPolled: time.Time{},
-				nextPoll:   now.Add(initialDelay),
-			})
-		}
-	}
-
-	addRepos(config.Repos.High, "high", config.PollIntervals.High)
-	addRepos(config.Repos.Medium, "medium", config.PollIntervals.Medium)
-	addRepos(config.Repos.Low, "low", config.PollIntervals.Low)
-}
-
-func addJitter(interval time.Duration) time.Duration {
-	jitter := time.Duration(float64(interval) * jitterFraction * (2*rand.Float64() - 1))
-	return interval + jitter
 }
 
 func initClients() {
@@ -234,56 +168,12 @@ func getClientForOrg(org string) *github.Client {
 	return nil
 }
 
-func ignoredFilePath() string {
-	return filepath.Join(configDir, "ignored.json")
-}
-
-func loadIgnored() error {
-	ignoredPRs = make(map[string]bool)
-
-	data, err := os.ReadFile(ignoredFilePath())
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-
-	var keys []string
-	if err := json.Unmarshal(data, &keys); err != nil {
-		return err
-	}
-
-	for _, key := range keys {
-		ignoredPRs[key] = true
-	}
-	return nil
-}
-
-func saveIgnored() error {
-	ignoreMutex.RLock()
-	keys := make([]string, 0, len(ignoredPRs))
-	for key := range ignoredPRs {
-		keys = append(keys, key)
-	}
-	ignoreMutex.RUnlock()
-
-	sort.Strings(keys)
-	data, err := json.MarshalIndent(keys, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	return os.WriteFile(ignoredFilePath(), data, 0644)
-}
-
 func ignorePR(key string) {
-	ignoreMutex.Lock()
-	ignoredPRs[key] = true
-	ignoreMutex.Unlock()
-
-	if err := saveIgnored(); err != nil {
-		log.Printf("Error saving ignored PRs: %v", err)
+	repo, number := parsePRKey(key)
+	if repo != "" && number > 0 {
+		if err := dbIgnorePR(repo, number); err != nil {
+			log.Printf("Error ignoring PR %s: %v", key, err)
+		}
 	}
 
 	prsMutex.Lock()
@@ -300,33 +190,23 @@ func ignorePR(key string) {
 }
 
 func clearIgnored() {
-	ignoreMutex.Lock()
-	ignoredPRs = make(map[string]bool)
-	ignoreMutex.Unlock()
-
-	if err := saveIgnored(); err != nil {
-		log.Printf("Error saving ignored PRs: %v", err)
+	if err := dbClearIgnored(); err != nil {
+		log.Printf("Error clearing ignored PRs: %v", err)
 	}
 
 	go refreshAllRepos()
 }
 
-func isIgnored(key string) bool {
-	ignoreMutex.RLock()
-	defer ignoreMutex.RUnlock()
-	return ignoredPRs[key]
-}
-
-func ignoredCount() int {
-	ignoreMutex.RLock()
-	defer ignoreMutex.RUnlock()
-	return len(ignoredPRs)
-}
-
 func onReady() {
 	systray.SetIcon(getIcon(false))
 	systray.SetTitle("")
-	systray.SetTooltip("PR Monitor - Loading...")
+
+	prsMutex.RLock()
+	hasCached := len(prs) > 0
+	prsMutex.RUnlock()
+	if !hasCached {
+		systray.SetTooltip("PR Monitor - Loading...")
+	}
 
 	mRefresh := systray.AddMenuItem("Refresh Now", "Check all repos now")
 	systray.AddSeparator()
@@ -346,7 +226,22 @@ func onReady() {
 	mClearIgnored.Hide()
 	mQuit := systray.AddMenuItem("Quit", "Quit PR Monitor")
 
-	go schedulerLoop()
+	// If cached PRs were loaded, update the menu items now that they exist
+	if hasCached {
+		updateMenu()
+	}
+
+	// Choose polling strategy based on notification access
+	if validateNotificationAccess() {
+		log.Println("Notification access confirmed — using notification-driven polling")
+		go notificationLoop()
+		go fullRefreshLoop()
+	} else {
+		log.Println("Notification access unavailable — falling back to periodic polling")
+		go legacySchedulerLoop()
+	}
+
+	resumeRechecks()
 
 	go func() {
 		for {
@@ -372,13 +267,17 @@ func handlePRMenuClicks(index int, item PRMenuItem) {
 		case <-item.parent.ClickedCh:
 			prsMutex.RLock()
 			if index < len(prs) {
-				openURL(prs[index].URL)
+				pr := prs[index]
+				openURL(pr.URL)
+				go scheduleRecheck(pr)
 			}
 			prsMutex.RUnlock()
 		case <-item.open.ClickedCh:
 			prsMutex.RLock()
 			if index < len(prs) {
-				openURL(prs[index].URL)
+				pr := prs[index]
+				openURL(pr.URL)
+				go scheduleRecheck(pr)
 			}
 			prsMutex.RUnlock()
 		case <-item.ignore.ClickedCh:
@@ -405,50 +304,188 @@ func handlePRMenuClicks(index int, item PRMenuItem) {
 	}
 }
 
-func onExit() {}
-
-func schedulerLoop() {
-	// Initial full refresh
-	refreshAllRepos()
-
-	ticker := time.NewTicker(schedulerInterval)
-	for range ticker.C {
-		checkAndPollRepos()
+func onExit() {
+	if db != nil {
+		db.Close()
 	}
 }
 
-func checkAndPollRepos() {
-	now := time.Now()
-	var reposToRefresh []string
+var recheckSchedule []time.Duration
 
-	repoMutex.Lock()
-	for _, state := range repoStates {
-		if now.After(state.nextPoll) {
-			reposToRefresh = append(reposToRefresh, state.name)
-			state.lastPolled = now
-			state.nextPoll = now.Add(addJitter(state.interval))
+func init() {
+	for range 10 {
+		recheckSchedule = append(recheckSchedule, 1*time.Minute)
+	}
+	for range 10 {
+		recheckSchedule = append(recheckSchedule, 2*time.Minute)
+	}
+	for range 6 {
+		recheckSchedule = append(recheckSchedule, 5*time.Minute)
+	}
+}
+
+// recheckTotalDuration is how long the full schedule runs from start
+func recheckTotalDuration() time.Duration {
+	var total time.Duration
+	for _, d := range recheckSchedule {
+		total += d
+	}
+	return total
+}
+
+// activeRechecks tracks running goroutines so we don't double-up on the same PR
+var activeRechecks sync.Map
+
+// scheduleRecheck persists a recheck request and starts polling a single PR
+// on an escalating schedule so the menu updates quickly after the user reviews it.
+func scheduleRecheck(pr PRInfo) {
+	key := pr.Key()
+
+	if err := dbAddRecheck(pr.Repo, pr.Number); err != nil {
+		log.Printf("Error scheduling recheck for %s: %v", key, err)
+		return
+	}
+
+	startRecheck(pr.Repo, pr.Number, time.Now())
+}
+
+// startRecheck begins (or resumes) the recheck loop for a single PR.
+func startRecheck(repo string, number int, startedAt time.Time) {
+	key := fmt.Sprintf("%s#%d", repo, number)
+
+	// Don't start a second goroutine for the same PR
+	if _, loaded := activeRechecks.LoadOrStore(key, true); loaded {
+		return
+	}
+
+	go func() {
+		defer activeRechecks.Delete(key)
+		defer dbRemoveRecheck(repo, number)
+
+		runRecheckLoop(repo, number, startedAt)
+	}()
+}
+
+func runRecheckLoop(repo string, number int, startedAt time.Time) {
+	owner, repoName := parseRepo(repo)
+	client := getClientForOrg(owner)
+	if client == nil {
+		return
+	}
+
+	ctx := context.Background()
+	authorSet := make(map[string]bool)
+	for _, a := range config.Authors {
+		authorSet[a] = true
+	}
+
+	// Compute the absolute time of each check
+	elapsed := time.Since(startedAt)
+	var cumulative time.Duration
+	didCatchUp := false
+
+	for _, interval := range recheckSchedule {
+		cumulative += interval
+
+		if cumulative <= elapsed {
+			// We've already passed this check time (e.g. after restart)
+			// Do one catch-up poll for the last missed check
+			if !didCatchUp && cumulative+interval > elapsed {
+				didCatchUp = true
+				if recheckPR(ctx, client, owner, repoName, repo, number, authorSet) {
+					return
+				}
+			}
+			continue
+		}
+
+		// Wait until this check is due
+		waitTime := cumulative - elapsed
+		time.Sleep(waitTime)
+		elapsed = time.Since(startedAt)
+
+		if recheckPR(ctx, client, owner, repoName, repo, number, authorSet) {
+			return
 		}
 	}
-	repoMutex.Unlock()
+}
 
-	if len(reposToRefresh) > 0 {
-		refreshRepos(reposToRefresh)
+// recheckPR checks a single PR's status. Returns true if the recheck loop should stop.
+func recheckPR(ctx context.Context, client *github.Client, owner, repoName, repo string, number int, authorSet map[string]bool) bool {
+	if dbIsIgnored(repo, number) {
+		return true
+	}
+
+	ghPR, _, err := client.PullRequests.Get(ctx, owner, repoName, number)
+	if err != nil {
+		log.Printf("Recheck: error fetching %s#%d: %v", repo, number, err)
+		return false
+	}
+
+	if ghPR.GetState() != "open" || ghPR.GetDraft() || !authorSet[ghPR.GetUser().GetLogin()] {
+		dbRemovePR(repo, number)
+		reloadPRsFromDB()
+		return true
+	}
+
+	needsReview, needsReapproval := checkReviewStatus(ctx, client, owner, repoName, ghPR)
+	if !needsReview && !needsReapproval {
+		dbRemovePR(repo, number)
+		reloadPRsFromDB()
+		return true
+	}
+
+	dbSavePR(PRInfo{
+		Repo:            repo,
+		Number:          ghPR.GetNumber(),
+		Title:           ghPR.GetTitle(),
+		Author:          ghPR.GetUser().GetLogin(),
+		URL:             ghPR.GetHTMLURL(),
+		NeedsReview:     needsReview,
+		NeedsReapproval: needsReapproval,
+	})
+	reloadPRsFromDB()
+	return false
+}
+
+// resumeRechecks loads pending rechecks from the DB and resumes them.
+func resumeRechecks() {
+	entries, err := dbLoadRechecks()
+	if err != nil {
+		log.Printf("Error loading rechecks: %v", err)
+		return
+	}
+
+	now := time.Now()
+	for _, e := range entries {
+		if now.Sub(e.StartedAt) > recheckTotalDuration() {
+			// Schedule fully expired — do one final check then clean up
+			go func(e recheckEntry) {
+				defer dbRemoveRecheck(e.Repo, e.Number)
+
+				owner, repoName := parseRepo(e.Repo)
+				client := getClientForOrg(owner)
+				if client == nil {
+					return
+				}
+				authorSet := make(map[string]bool)
+				for _, a := range config.Authors {
+					authorSet[a] = true
+				}
+				recheckPR(context.Background(), client, owner, repoName, e.Repo, e.Number, authorSet)
+			}(e)
+		} else {
+			startRecheck(e.Repo, e.Number, e.StartedAt)
+		}
+	}
+
+	if len(entries) > 0 {
+		log.Printf("Resumed %d pending rechecks", len(entries))
 	}
 }
 
 func refreshAllRepos() {
-	now := time.Now()
-
-	repoMutex.Lock()
-	allRepos := make([]string, len(repoStates))
-	for i, state := range repoStates {
-		allRepos[i] = state.name
-		state.lastPolled = now
-		state.nextPoll = now.Add(addJitter(state.interval))
-	}
-	repoMutex.Unlock()
-
-	refreshRepos(allRepos)
+	refreshRepos(config.Repos)
 }
 
 func refreshRepos(repos []string) {
@@ -462,13 +499,24 @@ func refreshRepos(repos []string) {
 	maxAge := time.Duration(config.MaxAgeDays) * 24 * time.Hour
 	cutoff := time.Now().Add(-maxAge)
 
-	// Collect PRs from specified repos
 	var newPRsFromRepos []PRInfo
 	repoSet := make(map[string]bool)
 	for _, repo := range repos {
 		repoSet[repo] = true
 		repoPRs := fetchRepoPRs(ctx, repo, authorSet, cutoff)
 		newPRsFromRepos = append(newPRsFromRepos, repoPRs...)
+	}
+
+	// Persist to DB: clear old active PRs for refreshed repos, save new ones
+	for _, repo := range repos {
+		if err := dbRemoveRepoActivePRs(repo); err != nil {
+			log.Printf("Error clearing DB PRs for %s: %v", repo, err)
+		}
+	}
+	for _, pr := range newPRsFromRepos {
+		if err := dbSavePR(pr); err != nil {
+			log.Printf("Error saving PR %s#%d to DB: %v", pr.Repo, pr.Number, err)
+		}
 	}
 
 	// Merge with existing PRs from repos we didn't refresh
@@ -481,7 +529,6 @@ func refreshRepos(repos []string) {
 	}
 	mergedPRs = append(mergedPRs, newPRsFromRepos...)
 
-	// Sort by repo then number
 	sort.Slice(mergedPRs, func(i, j int) bool {
 		if mergedPRs[i].Repo != mergedPRs[j].Repo {
 			return mergedPRs[i].Repo < mergedPRs[j].Repo
@@ -532,9 +579,13 @@ func fetchRepoPRs(ctx context.Context, repo string, authorSet map[string]bool, c
 			continue
 		}
 
+		if dbIsIgnored(repo, pr.GetNumber()) {
+			continue
+		}
+
 		needsReview, needsReapproval := checkReviewStatus(ctx, client, owner, repoName, pr)
 		if needsReview || needsReapproval {
-			prInfo := PRInfo{
+			result = append(result, PRInfo{
 				Repo:            repo,
 				Number:          pr.GetNumber(),
 				Title:           pr.GetTitle(),
@@ -542,11 +593,7 @@ func fetchRepoPRs(ctx context.Context, repo string, authorSet map[string]bool, c
 				URL:             pr.GetHTMLURL(),
 				NeedsReview:     needsReview,
 				NeedsReapproval: needsReapproval,
-			}
-
-			if !isIgnored(prInfo.Key()) {
-				result = append(result, prInfo)
-			}
+			})
 		}
 	}
 
@@ -614,7 +661,7 @@ func updateMenu() {
 	defer prsMutex.RUnlock()
 
 	count := len(prs)
-	ignored := ignoredCount()
+	ignored := dbIgnoredCount()
 
 	systray.SetIcon(getIcon(count > 0))
 
@@ -683,8 +730,6 @@ func reviewPR(pr PRInfo) {
 		status = "needs re-approval"
 	}
 
-	// Write a shell script that clones, gathers context, and launches claude —
-	// all visible in the terminal so the user can see progress.
 	script := fmt.Sprintf(`#!/bin/bash
 set -e
 
@@ -742,7 +787,7 @@ Please review this PR by:
 
 You have access to:
 - The full repository source (use Read/Grep/Glob to explore)
-- ` + "`" + `gh` + "`" + ` CLI for GitHub context (e.g. ` + "`" + `gh pr view` + "`" + `, ` + "`" + `gh pr checks` + "`" + `, linked issues)
+- `+"`"+`gh`+"`"+` CLI for GitHub context (e.g. `+"`"+`gh pr view`+"`"+`, `+"`"+`gh pr checks`+"`"+`, linked issues)
 
 Provide a structured review with:
 - A summary of what the PR does

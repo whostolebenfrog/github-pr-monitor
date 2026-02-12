@@ -2,6 +2,7 @@
 # Copy this file to ~/.config/pr-monitor/config.yaml
 
 # Default GitHub token (used as fallback for orgs without specific tokens)
+# Needs 'notifications' scope for notification-driven polling
 # Create one at: https://github.com/settings/tokens
 github_token: "ghp_your_default_token"
 
@@ -11,28 +12,21 @@ org_tokens:
   myorg: "ghp_token_for_myorg"
   anotherorg: "ghp_token_for_anotherorg"
 
-# Poll intervals by priority level (Go duration format: 1m, 5m, 30s, etc.)
-# High priority repos are checked frequently, low priority less often
-poll_intervals:
-  high: 2m      # Default: 2 minutes
-  medium: 15m   # Default: 15 minutes
-  low: 2h       # Default: 2 hours
-
 # Only show PRs created within the last N days (default: 3)
 max_age_days: 3
 
-# Repositories to monitor, grouped by priority (owner/repo format)
-# Higher priority repos are polled more frequently
+# Repositories to monitor (owner/repo format)
 repos:
-  high:
-    - "myorg/critical-service"
-    - "myorg/api"
-  medium:
-    - "myorg/frontend"
-    - "myorg/backend"
-  low:
-    - "anotherorg/docs"
-    - "anotherorg/internal-tools"
+  - "myorg/critical-service"
+  - "myorg/api"
+  - "myorg/frontend"
+  - "myorg/backend"
+  - "anotherorg/docs"
+  - "anotherorg/internal-tools"
+
+# How often to do a full refresh of all repos as a safety net (default: 30m)
+# The primary update mechanism is GitHub's Notifications API (~60s latency)
+# full_refresh_interval: 30m
 
 # GitHub usernames whose PRs you want to review
 # Only PRs from these authors will be shown

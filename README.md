@@ -4,9 +4,10 @@ A lightweight system tray app that monitors GitHub PRs from your colleagues that
 
 ## Features
 
-- Polls multiple GitHub repositories for open PRs
-- Priority-based polling: high/medium/low priority repos with different intervals
-- Jittered poll times to avoid API rate limit spikes
+- **Notification-driven updates** — uses GitHub's Notifications API with conditional requests (`If-Modified-Since`) so idle polls are free (304 Not Modified, no rate limit consumed)
+- **SQLite persistence** — PR state is cached in a local database so the menu populates instantly on restart
+- **Fallback full refresh** — periodic full scan (default 30min) catches anything notifications miss
+- **Smart recheck after opening** — when you open a PR, it's rechecked on an escalating schedule (1min/2min/5min) for up to an hour so it disappears quickly once reviewed
 - Filters PRs by specified authors (your colleagues)
 - Detects PRs that need review (no approvals yet)
 - Detects PRs that need re-approval (new commits after approval)
@@ -14,9 +15,11 @@ A lightweight system tray app that monitors GitHub PRs from your colleagues that
 - White system tray icon with red notification dot when PRs need attention
 - Shows PR count next to icon
 - Click any PR to open in browser
-- Ignore PRs you don't want to review (persisted across restarts)
+- Ignore PRs you don't want to review (persisted in database)
 - Review with Claude — clone the PR and launch an interactive Claude Code review session
 - Per-organization GitHub token support for fine-grained access
+- Graceful degradation — falls back to periodic polling if the token lacks `notifications` scope
+- One-time notification cleanup on first run (marks all existing notifications as read)
 
 ## Installation
 
@@ -45,40 +48,24 @@ go install .
    ```
 
 3. Edit `~/.config/pr-monitor/config.yaml`:
-   - Add your GitHub personal access token (needs `repo` scope)
+   - Add your GitHub personal access token (needs `repo` and `notifications` scopes)
    - List the repositories to monitor
    - List the GitHub usernames of colleagues whose PRs you want to track
 
 ### Getting a GitHub Token
 
-PR Monitor needs a GitHub token to access the API. The app reads:
-- Pull request metadata (title, author, URL)
-- Pull request reviews (to check approval status)
-- Pull request commits (to detect new commits after approval)
+PR Monitor needs a GitHub token with these scopes:
+- **`repo`** — access to private repository PRs, reviews, and commits
+- **`notifications`** — for notification-driven polling (optional, falls back to periodic polling without it)
 
-#### Option 1: Fine-grained personal access token (Recommended)
-
-1. Go to https://github.com/settings/tokens?type=beta
-2. Click "Generate new token"
-3. Give it a name like "PR Monitor"
-4. Set expiration as desired
-5. Under "Repository access", select the repos you want to monitor
-6. Under "Permissions" → "Repository permissions":
-   - **Pull requests**: Read-only
-   - **Metadata**: Read-only (automatically selected)
-7. Click "Generate token" and copy it to your config file
-
-#### Option 2: Classic personal access token
+#### Classic personal access token
 
 1. Go to https://github.com/settings/tokens
 2. Click "Generate new token (classic)"
 3. Give it a name like "PR Monitor"
-4. Select scopes:
-   - `repo` - for private repositories (grants full access)
-   - `public_repo` - for public repositories only
+4. Select scopes: `repo`, `notifications`
 5. Click "Generate token" and copy it to your config file
-
-**Note**: Fine-grained tokens are more secure as they limit access to specific repositories with read-only permissions.
+6. If your org uses SSO, click "Configure SSO" and authorize the token
 
 ## Usage
 
@@ -89,6 +76,14 @@ Simply run:
 ```
 
 The app will appear in your system tray with a PR icon. When PRs need attention, a count appears next to the icon.
+
+### How Polling Works
+
+1. **Startup** — loads cached PRs from SQLite for instant display, then does a full refresh
+2. **Notification polling** (~60s) — checks GitHub's notifications endpoint. Returns 304 (free) when nothing changed. When a notification arrives for a configured repo, fetches that specific PR's details and updates the database.
+3. **Full refresh** (every 30min) — scans all configured repos as a safety net for anything notifications missed
+4. **Recheck after open** — when you click a PR to open in browser, it's rechecked on a schedule (10x at 1min, 10x at 2min, 6x at 5min) so it disappears quickly once you've reviewed it. This schedule persists across restarts.
+5. All notification threads are marked as read to keep the `If-Modified-Since` mechanism working
 
 ### System Tray Icon
 
@@ -109,7 +104,11 @@ The app displays a white merge/PR icon in your system tray, designed for visibil
 
 **Tooltip** - Hover over the icon to see count details including ignored PRs.
 
-Ignored PRs are stored in `~/.config/pr-monitor/ignored.json` and persist across restarts.
+### Data Storage
+
+All persistent state is stored in `~/.config/pr-monitor/`:
+- `config.yaml` — configuration
+- `pr-monitor.db` — SQLite database (PR cache, ignored PRs, notification state, recheck queue)
 
 ## Running at Login
 
@@ -132,35 +131,25 @@ Add a shortcut to `pr-monitor.exe` in your Startup folder (`shell:startup`).
 ## Configuration Options
 
 ```yaml
-# Default GitHub token (fallback for orgs without specific tokens)
+# GitHub token (needs 'repo' and 'notifications' scopes)
 github_token: "ghp_your_token_here"
 
 # Per-organization tokens (optional)
-# Use this when you have fine-grained tokens scoped to specific orgs
 # These take precedence over github_token for matching orgs
 org_tokens:
   myorg: "ghp_token_for_myorg"
-  anotherorg: "ghp_token_for_anotherorg"
-
-# Poll intervals by priority level (Go duration format: 1m, 5m, 30s, etc.)
-# Higher priority repos are checked more frequently
-poll_intervals:
-  high: 2m      # Default: 2 minutes
-  medium: 15m   # Default: 15 minutes
-  low: 2h       # Default: 2 hours
 
 # Only show PRs created within the last N days (default: 3)
 max_age_days: 3
 
-# Repositories to monitor, grouped by priority (owner/repo format)
+# Repositories to monitor (owner/repo format)
 repos:
-  high:
-    - "myorg/critical-service"
-  medium:
-    - "myorg/repo1"
-    - "myorg/repo2"
-  low:
-    - "anotherorg/docs"
+  - "myorg/critical-service"
+  - "myorg/api"
+  - "anotherorg/docs"
+
+# How often to do a full refresh as a safety net (default: 30m)
+# full_refresh_interval: 30m
 
 # GitHub usernames whose PRs you want to review
 authors:
@@ -175,16 +164,16 @@ authors:
 github_token: "ghp_classic_token_with_repo_scope"
 ```
 
-**Multiple orgs with fine-grained tokens:**
+**Multiple orgs with different tokens:**
 ```yaml
 org_tokens:
-  mycompany: "github_pat_xxx"  # Fine-grained token for mycompany org
-  opensource: "github_pat_yyy" # Fine-grained token for opensource org
+  mycompany: "ghp_xxx"
+  opensource: "ghp_yyy"
 ```
 
-**Mixed (fine-grained for some orgs, classic fallback for others):**
+**Mixed (org-specific + fallback):**
 ```yaml
 github_token: "ghp_classic_fallback"  # Used for any org not in org_tokens
 org_tokens:
-  private-org: "github_pat_xxx"  # Fine-grained token for specific org
+  private-org: "ghp_xxx"  # Token for specific org
 ```

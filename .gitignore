@@ -12,5 +12,5 @@ pr-monitor.exe
 .DS_Store
 Thumbs.db
 
-# Config (contains secrets)
-config.yaml
+# Claude Code
+.claude
