@@ -160,7 +160,11 @@ func processNotifications(ctx context.Context, notifications []*github.Notificat
 			continue
 		}
 
-		if dbIsIgnored(repo, prNumber) {
+		if n.GetReason() == "review_requested" {
+			dbUnmutePR(repo, prNumber)
+		}
+
+		if dbIsIgnored(repo, prNumber) || dbIsMuted(repo, prNumber) {
 			markThreadRead(ctx, n.GetID())
 			continue
 		}

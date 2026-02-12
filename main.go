@@ -45,10 +45,11 @@ func (pr PRInfo) Key() string {
 }
 
 type PRMenuItem struct {
-	parent *systray.MenuItem
-	open   *systray.MenuItem
-	ignore *systray.MenuItem
-	review *systray.MenuItem
+	parent   *systray.MenuItem
+	open     *systray.MenuItem
+	ignore   *systray.MenuItem
+	reviewed *systray.MenuItem
+	review   *systray.MenuItem
 }
 
 var (
@@ -60,6 +61,7 @@ var (
 	prsMutex      sync.RWMutex
 	menuItems     []PRMenuItem
 	mClearIgnored *systray.MenuItem
+	mClearMuted   *systray.MenuItem
 )
 
 func main() {
@@ -197,6 +199,35 @@ func clearIgnored() {
 	go refreshAllRepos()
 }
 
+func mutePR(key string) {
+	repo, number := parsePRKey(key)
+	if repo != "" && number > 0 {
+		if err := dbMutePR(repo, number); err != nil {
+			log.Printf("Error muting PR %s: %v", key, err)
+		}
+	}
+
+	prsMutex.Lock()
+	filtered := make([]PRInfo, 0, len(prs))
+	for _, pr := range prs {
+		if pr.Key() != key {
+			filtered = append(filtered, pr)
+		}
+	}
+	prs = filtered
+	prsMutex.Unlock()
+
+	updateMenu()
+}
+
+func clearMuted() {
+	if err := dbClearMuted(); err != nil {
+		log.Printf("Error clearing muted PRs: %v", err)
+	}
+
+	go refreshAllRepos()
+}
+
 func onReady() {
 	systray.SetIcon(getIcon(false))
 	systray.SetTitle("")
@@ -214,16 +245,20 @@ func onReady() {
 	for i := 0; i < maxMenuItems; i++ {
 		parent := systray.AddMenuItem("", "")
 		open := parent.AddSubMenuItem("Open in Browser", "Open this PR in your browser")
-		ignore := parent.AddSubMenuItem("Ignore", "Hide this PR from the list")
+		ignore := parent.AddSubMenuItem("Ignore", "Hide this PR permanently")
+		reviewed := parent.AddSubMenuItem("Mark as Reviewed", "Hide until review is re-requested")
 		review := parent.AddSubMenuItem("Review with Claude", "Clone and review this PR with Claude Code")
 		parent.Hide()
-		menuItems = append(menuItems, PRMenuItem{parent: parent, open: open, ignore: ignore, review: review})
+		menuItems = append(menuItems, PRMenuItem{parent: parent, open: open, ignore: ignore, reviewed: reviewed, review: review})
 	}
 
 	systray.AddSeparator()
 	mClearIgnored = systray.AddMenuItem("Clear Ignored PRs", "Show all previously ignored PRs again")
 	mClearConfirm := mClearIgnored.AddSubMenuItem("Yes, clear all ignored PRs", "This cannot be undone")
 	mClearIgnored.Hide()
+	mClearMuted = systray.AddMenuItem("Clear Reviewed PRs", "Show all previously reviewed PRs again")
+	mClearMutedConfirm := mClearMuted.AddSubMenuItem("Yes, clear all reviewed PRs", "This cannot be undone")
+	mClearMuted.Hide()
 	mQuit := systray.AddMenuItem("Quit", "Quit PR Monitor")
 
 	// If cached PRs were loaded, update the menu items now that they exist
@@ -250,6 +285,8 @@ func onReady() {
 				go refreshAllRepos()
 			case <-mClearConfirm.ClickedCh:
 				clearIgnored()
+			case <-mClearMutedConfirm.ClickedCh:
+				clearMuted()
 			case <-mQuit.ClickedCh:
 				systray.Quit()
 			}
@@ -289,6 +326,16 @@ func handlePRMenuClicks(index int, item PRMenuItem) {
 			prsMutex.RUnlock()
 			if key != "" {
 				ignorePR(key)
+			}
+		case <-item.reviewed.ClickedCh:
+			prsMutex.RLock()
+			var key string
+			if index < len(prs) {
+				key = prs[index].Key()
+			}
+			prsMutex.RUnlock()
+			if key != "" {
+				mutePR(key)
 			}
 		case <-item.review.ClickedCh:
 			prsMutex.RLock()
@@ -412,7 +459,7 @@ func runRecheckLoop(repo string, number int, startedAt time.Time) {
 
 // recheckPR checks a single PR's status. Returns true if the recheck loop should stop.
 func recheckPR(ctx context.Context, client *github.Client, owner, repoName, repo string, number int, authorSet map[string]bool) bool {
-	if dbIsIgnored(repo, number) {
+	if dbIsIgnored(repo, number) || dbIsMuted(repo, number) {
 		return true
 	}
 
@@ -579,7 +626,7 @@ func fetchRepoPRs(ctx context.Context, repo string, authorSet map[string]bool, c
 			continue
 		}
 
-		if dbIsIgnored(repo, pr.GetNumber()) {
+		if dbIsIgnored(repo, pr.GetNumber()) || dbIsMuted(repo, pr.GetNumber()) {
 			continue
 		}
 
@@ -662,21 +709,32 @@ func updateMenu() {
 
 	count := len(prs)
 	ignored := dbIgnoredCount()
+	muted := dbMutedCount()
 
 	systray.SetIcon(getIcon(count > 0))
 
 	if count == 0 {
 		systray.SetTitle("")
-		if ignored > 0 {
+		switch {
+		case ignored > 0 && muted > 0:
+			systray.SetTooltip(fmt.Sprintf("No PRs need attention (%d ignored, %d reviewed)", ignored, muted))
+		case ignored > 0:
 			systray.SetTooltip(fmt.Sprintf("No PRs need attention (%d ignored)", ignored))
-		} else {
+		case muted > 0:
+			systray.SetTooltip(fmt.Sprintf("No PRs need attention (%d reviewed)", muted))
+		default:
 			systray.SetTooltip("No PRs need your attention")
 		}
 	} else {
 		systray.SetTitle(fmt.Sprintf("%d", count))
-		if ignored > 0 {
+		switch {
+		case ignored > 0 && muted > 0:
+			systray.SetTooltip(fmt.Sprintf("%d PRs need attention (%d ignored, %d reviewed)", count, ignored, muted))
+		case ignored > 0:
 			systray.SetTooltip(fmt.Sprintf("%d PRs need attention (%d ignored)", count, ignored))
-		} else {
+		case muted > 0:
+			systray.SetTooltip(fmt.Sprintf("%d PRs need attention (%d reviewed)", count, muted))
+		default:
 			systray.SetTooltip(fmt.Sprintf("%d PRs need your attention", count))
 		}
 	}
@@ -686,6 +744,13 @@ func updateMenu() {
 		mClearIgnored.Show()
 	} else {
 		mClearIgnored.Hide()
+	}
+
+	if muted > 0 {
+		mClearMuted.SetTitle(fmt.Sprintf("Clear Reviewed PRs (%d)", muted))
+		mClearMuted.Show()
+	} else {
+		mClearMuted.Hide()
 	}
 
 	for i, item := range menuItems {

@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -62,7 +63,17 @@ func runMigrations() error {
 			PRIMARY KEY (repo, number)
 		);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Add muted column if it doesn't exist
+	_, err = db.Exec(`ALTER TABLE prs ADD COLUMN muted INTEGER NOT NULL DEFAULT 0`)
+	if err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return err
+	}
+
+	return nil
 }
 
 func dbSavePR(pr PRInfo) error {
@@ -88,14 +99,14 @@ func dbRemovePR(repo string, number int) error {
 }
 
 func dbRemoveRepoActivePRs(repo string) error {
-	_, err := db.Exec("DELETE FROM prs WHERE repo = ? AND ignored = 0", repo)
+	_, err := db.Exec("DELETE FROM prs WHERE repo = ? AND ignored = 0 AND muted = 0", repo)
 	return err
 }
 
 func dbLoadActivePRs() ([]PRInfo, error) {
 	rows, err := db.Query(`
 		SELECT repo, number, title, author, url, needs_review, needs_reapproval
-		FROM prs WHERE ignored = 0
+		FROM prs WHERE ignored = 0 AND muted = 0
 		ORDER BY repo, number
 	`)
 	if err != nil {
@@ -145,6 +156,40 @@ func dbIgnoredCount() int {
 	var count int
 	db.QueryRow("SELECT COUNT(*) FROM prs WHERE ignored = 1").Scan(&count)
 	return count
+}
+
+func dbMutePR(repo string, number int) error {
+	_, err := db.Exec(`
+		INSERT INTO prs (repo, number, title, author, url, muted, last_checked)
+		VALUES (?, ?, '', '', '', 1, ?)
+		ON CONFLICT (repo, number) DO UPDATE SET muted = 1
+	`, repo, number, time.Now().Format(time.RFC3339))
+	return err
+}
+
+func dbUnmutePR(repo string, number int) error {
+	_, err := db.Exec("UPDATE prs SET muted = 0 WHERE repo = ? AND number = ?", repo, number)
+	return err
+}
+
+func dbIsMuted(repo string, number int) bool {
+	var muted int
+	err := db.QueryRow("SELECT muted FROM prs WHERE repo = ? AND number = ?", repo, number).Scan(&muted)
+	if err != nil {
+		return false
+	}
+	return muted != 0
+}
+
+func dbMutedCount() int {
+	var count int
+	db.QueryRow("SELECT COUNT(*) FROM prs WHERE muted = 1").Scan(&count)
+	return count
+}
+
+func dbClearMuted() error {
+	_, err := db.Exec("DELETE FROM prs WHERE muted = 1")
+	return err
 }
 
 func dbGetState(key string) string {

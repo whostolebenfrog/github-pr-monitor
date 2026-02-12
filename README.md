@@ -16,6 +16,7 @@ A lightweight system tray app that monitors GitHub PRs from your colleagues that
 - Shows PR count next to icon
 - Click any PR to open in browser
 - Ignore PRs you don't want to review (persisted in database)
+- Mark as Reviewed — hides a PR until your review is re-requested
 - Review with Claude — clone the PR and launch an interactive Claude Code review session
 - Per-organization GitHub token support for fine-grained access
 - Graceful degradation — falls back to periodic polling if the token lacks `notifications` scope
@@ -97,12 +98,14 @@ The app displays a white merge/PR icon in your system tray, designed for visibil
 - **Refresh Now** - Manually refresh the PR list
 - **PR List** - Shows PRs needing review (click to expand submenu)
   - **Open in Browser** - Opens the PR in your default browser
-  - **Ignore** - Hides this PR from the list
+  - **Ignore** - Permanently hides this PR from the list
+  - **Mark as Reviewed** - Hides this PR until your review is re-requested on GitHub
   - **Review with Claude** - Clones the repo into a temp directory, checks out the PR branch, and opens a Terminal window with Claude Code pre-loaded with a review prompt. Requires `gh` and `claude` on your PATH. (macOS only)
 - **Clear Ignored PRs (N)** - Shows count; requires confirmation click to clear
+- **Clear Reviewed PRs (N)** - Shows count; requires confirmation click to clear
 - **Quit** - Exit PR Monitor
 
-**Tooltip** - Hover over the icon to see count details including ignored PRs.
+**Tooltip** - Hover over the icon to see count details including ignored and reviewed PRs.
 
 ### Data Storage
 
