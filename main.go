@@ -75,6 +75,7 @@ type PRMenuItem struct {
 	parent *systray.MenuItem
 	open   *systray.MenuItem
 	ignore *systray.MenuItem
+	review *systray.MenuItem
 }
 
 type repoState struct {
@@ -334,8 +335,9 @@ func onReady() {
 		parent := systray.AddMenuItem("", "")
 		open := parent.AddSubMenuItem("Open in Browser", "Open this PR in your browser")
 		ignore := parent.AddSubMenuItem("Ignore", "Hide this PR from the list")
+		review := parent.AddSubMenuItem("Review with Claude", "Clone and review this PR with Claude Code")
 		parent.Hide()
-		menuItems = append(menuItems, PRMenuItem{parent: parent, open: open, ignore: ignore})
+		menuItems = append(menuItems, PRMenuItem{parent: parent, open: open, ignore: ignore, review: review})
 	}
 
 	systray.AddSeparator()
@@ -388,6 +390,16 @@ func handlePRMenuClicks(index int, item PRMenuItem) {
 			prsMutex.RUnlock()
 			if key != "" {
 				ignorePR(key)
+			}
+		case <-item.review.ClickedCh:
+			prsMutex.RLock()
+			var pr PRInfo
+			if index < len(prs) {
+				pr = prs[index]
+			}
+			prsMutex.RUnlock()
+			if pr.Repo != "" {
+				go reviewPR(pr)
 			}
 		}
 	}
@@ -651,6 +663,119 @@ func truncate(s string, maxLen int) string {
 		return s
 	}
 	return string(runes[:maxLen-3]) + "..."
+}
+
+func reviewPR(pr PRInfo) {
+	if runtime.GOOS != "darwin" {
+		log.Printf("Review with Claude is currently only supported on macOS")
+		return
+	}
+
+	owner, repo := parseRepo(pr.Repo)
+	tempDir, err := os.MkdirTemp("", fmt.Sprintf("pr-review-%s-%s-%d-*", owner, repo, pr.Number))
+	if err != nil {
+		log.Printf("Failed to create temp dir for review: %v", err)
+		return
+	}
+
+	status := "needs review"
+	if pr.NeedsReapproval {
+		status = "needs re-approval"
+	}
+
+	// Write a shell script that clones, gathers context, and launches claude —
+	// all visible in the terminal so the user can see progress.
+	script := fmt.Sprintf(`#!/bin/bash
+set -e
+
+REPO='%s'
+PR_NUM=%d
+AUTHOR='%s'
+STATUS='%s'
+DIR='%s'
+
+echo "==> Cloning $REPO (blobless for speed)..."
+gh repo clone "$REPO" "$DIR/repo" -- --filter=blob:none
+cd "$DIR/repo"
+
+echo "==> Checking out PR #$PR_NUM..."
+gh pr checkout "$PR_NUM"
+
+echo "==> Gathering PR context..."
+PR_JSON=$(gh pr view "$PR_NUM" --json title,body,baseRefName,headRefName,commits)
+PR_TITLE=$(echo "$PR_JSON" | jq -r '.title')
+PR_BODY=$(echo "$PR_JSON" | jq -r '.body')
+BASE_REF=$(echo "$PR_JSON" | jq -r '.baseRefName')
+HEAD_REF=$(echo "$PR_JSON" | jq -r '.headRefName')
+NUM_COMMITS=$(echo "$PR_JSON" | jq '.commits | length')
+
+DIFF_STAT=$(gh pr diff "$PR_NUM" --stat 2>/dev/null || echo "(could not fetch diff stat)")
+COMMIT_LOG=$(git log --oneline "$BASE_REF..$HEAD_REF" 2>/dev/null || echo "(could not fetch commit log)")
+
+echo "==> Building review prompt..."
+cat > "$DIR/prompt.md" <<PROMPT_EOF
+You are reviewing a pull request. Here is the context:
+
+Repository: $REPO
+PR #$PR_NUM: $PR_TITLE
+Author: @$AUTHOR
+Status: $STATUS
+
+PR Description:
+$PR_BODY
+
+This PR contains $NUM_COMMITS commits:
+$COMMIT_LOG
+
+Files changed:
+$DIFF_STAT
+
+You are in a local checkout of this PR. The full source code is available to you.
+
+Please review this PR by:
+1. Reading the changed files to understand the full context of each change
+2. Checking for correctness, bugs, edge cases, and error handling
+3. Evaluating code style and consistency with the surrounding codebase
+4. Looking for security issues (injection, auth, data leaks, etc.)
+5. Assessing test coverage — are the changes adequately tested?
+6. Noting any performance concerns
+
+You have access to:
+- The full repository source (use Read/Grep/Glob to explore)
+- ` + "`" + `gh` + "`" + ` CLI for GitHub context (e.g. ` + "`" + `gh pr view` + "`" + `, ` + "`" + `gh pr checks` + "`" + `, linked issues)
+
+Provide a structured review with:
+- A summary of what the PR does
+- Issues found (critical, suggestions, nits) with file:line references
+- Questions for the author
+- Overall assessment
+PROMPT_EOF
+
+echo "==> Launching Claude Code for review..."
+echo ""
+exec claude "$(cat "$DIR/prompt.md")"
+`, pr.Repo, pr.Number, pr.Author, status, tempDir)
+
+	scriptPath := filepath.Join(tempDir, "review.sh")
+	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+		log.Printf("Failed to write review script: %v", err)
+		return
+	}
+
+	openTerminalWithCommand(scriptPath)
+}
+
+func openTerminalWithCommand(scriptPath string) {
+	appleScript := fmt.Sprintf(`tell app "Terminal"
+	activate
+	do script "exec bash '%s'"
+end tell`, scriptPath)
+	cmd := exec.Command("osascript", "-e", appleScript)
+	if err := cmd.Start(); err != nil {
+		log.Printf("Failed to open terminal: %v", err)
+		return
+	}
+	go cmd.Wait()
 }
 
 func openURL(url string) {
