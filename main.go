@@ -895,8 +895,11 @@ Please review this PR by:
 2. Checking for correctness, bugs, edge cases, and error handling
 3. Evaluating code style and consistency with the surrounding codebase
 4. Looking for security issues (injection, auth, data leaks, etc.)
-5. Assessing test coverage — are the changes adequately tested?
-6. Noting any performance concerns
+5. Noting any performance concerns
+
+Assume CI tests have already passed. Do NOT run tests locally.
+If you have strong reason to believe a change would break tests, you can verify
+CI status with `+"`"+`gh pr checks`+"`"+` — but do not run test suites yourself.
 
 You have access to:
 - The full repository source (use Read/Grep/Glob to explore)
