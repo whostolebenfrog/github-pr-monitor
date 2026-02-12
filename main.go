@@ -55,6 +55,7 @@ type PRMenuItem struct {
 var (
 	config        Config
 	configDir     string
+	currentUser   string
 	defaultClient *github.Client
 	orgClients    map[string]*github.Client
 	prs           []PRInfo
@@ -156,6 +157,16 @@ func initClients() {
 
 	if defaultClient == nil && len(orgClients) == 0 {
 		log.Fatal("No GitHub tokens configured. Set github_token or org_tokens in config.")
+	}
+
+	if defaultClient != nil {
+		user, _, err := defaultClient.Users.Get(ctx, "")
+		if err != nil {
+			log.Printf("Warning: failed to fetch authenticated user: %v", err)
+		} else {
+			currentUser = user.GetLogin()
+			log.Printf("Authenticated as %s", currentUser)
+		}
 	}
 }
 
@@ -626,8 +637,17 @@ func fetchRepoPRs(ctx context.Context, repo string, authorSet map[string]bool, c
 			continue
 		}
 
-		if dbIsIgnored(repo, pr.GetNumber()) || dbIsMuted(repo, pr.GetNumber()) {
+		if dbIsIgnored(repo, pr.GetNumber()) {
 			continue
+		}
+
+		if dbIsMuted(repo, pr.GetNumber()) {
+			if isReviewRequestedForUser(pr) {
+				log.Printf("Un-muting %s#%d: review re-requested", repo, pr.GetNumber())
+				dbUnmutePR(repo, pr.GetNumber())
+			} else {
+				continue
+			}
 		}
 
 		needsReview, needsReapproval := checkReviewStatus(ctx, client, owner, repoName, pr)
@@ -696,6 +716,18 @@ func checkReviewStatus(ctx context.Context, client *github.Client, owner, repo s
 	}
 
 	return false, false
+}
+
+func isReviewRequestedForUser(pr *github.PullRequest) bool {
+	if currentUser == "" {
+		return false
+	}
+	for _, reviewer := range pr.RequestedReviewers {
+		if reviewer.GetLogin() == currentUser {
+			return true
+		}
+	}
+	return false
 }
 
 func parseRepo(repo string) (owner, name string) {

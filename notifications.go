@@ -160,11 +160,7 @@ func processNotifications(ctx context.Context, notifications []*github.Notificat
 			continue
 		}
 
-		if n.GetReason() == "review_requested" {
-			dbUnmutePR(repo, prNumber)
-		}
-
-		if dbIsIgnored(repo, prNumber) || dbIsMuted(repo, prNumber) {
+		if dbIsIgnored(repo, prNumber) {
 			markThreadRead(ctx, n.GetID())
 			continue
 		}
@@ -181,6 +177,16 @@ func processNotifications(ctx context.Context, notifications []*github.Notificat
 			log.Printf("Error fetching PR %s#%d: %v", repo, prNumber, err)
 			markThreadRead(ctx, n.GetID())
 			continue
+		}
+
+		if dbIsMuted(repo, prNumber) {
+			if isReviewRequestedForUser(pr) {
+				log.Printf("Un-muting %s#%d: review re-requested", repo, prNumber)
+				dbUnmutePR(repo, prNumber)
+			} else {
+				markThreadRead(ctx, n.GetID())
+				continue
+			}
 		}
 
 		if pr.GetState() != "open" || pr.GetDraft() || !authorSet[pr.GetUser().GetLogin()] {
