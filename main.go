@@ -486,9 +486,16 @@ func recheckPR(ctx context.Context, client *github.Client, owner, repoName, repo
 		return true
 	}
 
-	needsReview, needsReapproval := checkReviewStatus(ctx, client, owner, repoName, ghPR)
+	needsReview, needsReapproval, currentUserReviewed := checkReviewStatus(ctx, client, owner, repoName, ghPR)
 	if !needsReview && !needsReapproval {
 		dbRemovePR(repo, number)
+		reloadPRsFromDB()
+		return true
+	}
+
+	if currentUserReviewed && !isReviewRequestedForUser(ghPR) {
+		log.Printf("Auto-muting %s#%d: current user already reviewed", repo, number)
+		dbMutePR(repo, number)
 		reloadPRsFromDB()
 		return true
 	}
@@ -650,32 +657,37 @@ func fetchRepoPRs(ctx context.Context, repo string, authorSet map[string]bool, c
 			}
 		}
 
-		needsReview, needsReapproval := checkReviewStatus(ctx, client, owner, repoName, pr)
+		needsReview, needsReapproval, currentUserReviewed := checkReviewStatus(ctx, client, owner, repoName, pr)
 		if needsReview || needsReapproval {
-			result = append(result, PRInfo{
-				Repo:            repo,
-				Number:          pr.GetNumber(),
-				Title:           pr.GetTitle(),
-				Author:          author,
-				URL:             pr.GetHTMLURL(),
-				NeedsReview:     needsReview,
-				NeedsReapproval: needsReapproval,
-			})
+			if currentUserReviewed && !isReviewRequestedForUser(pr) {
+				log.Printf("Auto-muting %s#%d: current user already reviewed", repo, pr.GetNumber())
+				dbMutePR(repo, pr.GetNumber())
+			} else {
+				result = append(result, PRInfo{
+					Repo:            repo,
+					Number:          pr.GetNumber(),
+					Title:           pr.GetTitle(),
+					Author:          author,
+					URL:             pr.GetHTMLURL(),
+					NeedsReview:     needsReview,
+					NeedsReapproval: needsReapproval,
+				})
+			}
 		}
 	}
 
 	return result
 }
 
-func checkReviewStatus(ctx context.Context, client *github.Client, owner, repo string, pr *github.PullRequest) (needsReview, needsReapproval bool) {
+func checkReviewStatus(ctx context.Context, client *github.Client, owner, repo string, pr *github.PullRequest) (needsReview, needsReapproval, currentUserReviewed bool) {
 	reviews, _, err := client.PullRequests.ListReviews(ctx, owner, repo, pr.GetNumber(), &github.ListOptions{PerPage: 100})
 	if err != nil {
 		log.Printf("Error fetching reviews for %s#%d: %v", repo, pr.GetNumber(), err)
-		return true, false
+		return true, false, false
 	}
 
 	if len(reviews) == 0 {
-		return true, false
+		return true, false, false
 	}
 
 	latestReviews := make(map[string]*github.PullRequestReview)
@@ -685,6 +697,10 @@ func checkReviewStatus(ctx context.Context, client *github.Client, owner, repo s
 		if !ok || review.GetSubmittedAt().After(existing.GetSubmittedAt().Time) {
 			latestReviews[user] = review
 		}
+	}
+
+	if currentUser != "" {
+		_, currentUserReviewed = latestReviews[currentUser]
 	}
 
 	var hasApproval bool
@@ -699,23 +715,23 @@ func checkReviewStatus(ctx context.Context, client *github.Client, owner, repo s
 	}
 
 	if !hasApproval {
-		return true, false
+		return true, false, currentUserReviewed
 	}
 
 	commits, _, err := client.PullRequests.ListCommits(ctx, owner, repo, pr.GetNumber(), &github.ListOptions{PerPage: 100})
 	if err != nil {
 		log.Printf("Error fetching commits for %s#%d: %v", repo, pr.GetNumber(), err)
-		return false, false
+		return false, false, currentUserReviewed
 	}
 
 	for _, commit := range commits {
 		commitDate := commit.GetCommit().GetCommitter().GetDate()
 		if commitDate.After(latestApprovalTime) {
-			return false, true
+			return false, true, currentUserReviewed
 		}
 	}
 
-	return false, false
+	return false, false, currentUserReviewed
 }
 
 func isReviewRequestedForUser(pr *github.PullRequest) bool {

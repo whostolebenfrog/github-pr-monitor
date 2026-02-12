@@ -196,21 +196,27 @@ func processNotifications(ctx context.Context, notifications []*github.Notificat
 			continue
 		}
 
-		needsReview, needsReapproval := checkReviewStatus(ctx, client, owner, repoName, pr)
+		needsReview, needsReapproval, currentUserReviewed := checkReviewStatus(ctx, client, owner, repoName, pr)
 		if needsReview || needsReapproval {
-			prInfo := PRInfo{
-				Repo:            repo,
-				Number:          pr.GetNumber(),
-				Title:           pr.GetTitle(),
-				Author:          pr.GetUser().GetLogin(),
-				URL:             pr.GetHTMLURL(),
-				NeedsReview:     needsReview,
-				NeedsReapproval: needsReapproval,
+			if currentUserReviewed && !isReviewRequestedForUser(pr) {
+				log.Printf("Auto-muting %s#%d: current user already reviewed", repo, prNumber)
+				dbMutePR(repo, prNumber)
+				updated = true
+			} else {
+				prInfo := PRInfo{
+					Repo:            repo,
+					Number:          pr.GetNumber(),
+					Title:           pr.GetTitle(),
+					Author:          pr.GetUser().GetLogin(),
+					URL:             pr.GetHTMLURL(),
+					NeedsReview:     needsReview,
+					NeedsReapproval: needsReapproval,
+				}
+				if err := dbSavePR(prInfo); err != nil {
+					log.Printf("Error saving PR %s#%d: %v", repo, prNumber, err)
+				}
+				updated = true
 			}
-			if err := dbSavePR(prInfo); err != nil {
-				log.Printf("Error saving PR %s#%d: %v", repo, prNumber, err)
-			}
-			updated = true
 		} else {
 			dbRemovePR(repo, prNumber)
 			updated = true
